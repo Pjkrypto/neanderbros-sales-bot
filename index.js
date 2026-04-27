@@ -6,6 +6,7 @@ import sharp from "sharp";
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
 
 const COLLECTIONS = {
   [process.env.NEANDERBROS_SLUG]: {
@@ -20,21 +21,6 @@ const COLLECTIONS = {
   },
 };
 
-function required(name) {
-  if (!process.env[name]) {
-    console.error(`Missing required environment variable: ${name}`);
-    process.exit(1);
-  }
-}
-
-[
-  "TELEGRAM_BOT_TOKEN",
-  "TELEGRAM_CHAT_ID",
-  "OPENSEA_API_KEY",
-  "NEANDERBROS_SLUG",
-  "NEANDERGALS_SLUG",
-].forEach(required);
-
 function getPayload(event) {
   return event?.payload || event;
 }
@@ -44,62 +30,71 @@ function getTokenInfo(payload) {
   const parts = nftId.split("/");
 
   return {
-    contract: parts[1] || payload?.item?.contract_address || "",
-    tokenId: parts[2] || parts.pop() || "",
+    contract: parts[1] || payload?.item?.contract_address,
+    tokenId: parts[2] || parts.pop(),
   };
 }
 
-function getImageUrl(payload) {
-  return (
-    payload?.item?.metadata?.image_url ||
-    payload?.item?.metadata?.image ||
-    payload?.item?.image_url ||
-    payload?.item?.display_image_url ||
-    ""
-  );
+async function getBestImage(contract, tokenId) {
+  try {
+    const res = await axios.get(
+      `https://api.opensea.io/api/v2/chain/polygon/contract/${contract}/nfts/${tokenId}`,
+      { headers: { "x-api-key": OPENSEA_API_KEY } }
+    );
+
+    return (
+      res.data?.nft?.image_url ||
+      res.data?.nft?.display_image_url ||
+      ""
+    );
+  } catch {
+    return "";
+  }
+}
+
+async function getFloor(slug) {
+  try {
+    const res = await axios.get(
+      `https://api.opensea.io/api/v2/collections/${slug}/stats`,
+      { headers: { "x-api-key": OPENSEA_API_KEY } }
+    );
+
+    return res.data?.total?.floor_price || 0;
+  } catch {
+    return 0;
+  }
 }
 
 function getPrice(payload) {
   const raw = Number(payload?.sale_price || 0);
-  const decimals = Number(payload?.payment_token?.decimals || 18);
+  const decimals = payload?.payment_token?.decimals || 18;
   const symbol = payload?.payment_token?.symbol || "POL";
-  const value = raw / Math.pow(10, decimals);
 
   return {
-    price: value.toLocaleString(undefined, {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 6,
-    }),
+    value: raw / Math.pow(10, decimals),
     symbol,
   };
 }
 
-async function sendText(caption) {
-  await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-    chat_id: CHAT_ID,
-    text: caption,
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-  });
+function formatPct(diff, floor) {
+  if (!floor) return "N/A";
+
+  const pct = ((diff / floor) * 100).toFixed(2);
+
+  if (pct > 0) return `📈 +${pct}% Above Floor`;
+  if (pct < 0) return `📉 ${pct}% Below Floor`;
+  return "➖ At Floor";
 }
 
 async function sendPhoto(imageUrl, caption) {
-  if (!imageUrl) {
-    throw new Error("No image URL available");
-  }
-
-  console.log("Downloading NFT image:", imageUrl);
-
   const img = await axios.get(imageUrl, {
     responseType: "arraybuffer",
-    timeout: 30000,
-    headers: {
-      "User-Agent": "Mozilla/5.0",
-      Accept: "image/*,*/*;q=0.8",
-    },
+    headers: { "User-Agent": "Mozilla/5.0" }
   });
 
-  const pngBuffer = await sharp(Buffer.from(img.data)).png().toBuffer();
+  const pngBuffer = await sharp(Buffer.from(img.data))
+    .png()
+    .toBuffer();
 
   const form = new FormData();
   form.append("chat_id", CHAT_ID);
@@ -113,9 +108,18 @@ async function sendPhoto(imageUrl, caption) {
   await axios.post(
     `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendPhoto`,
     form,
+    { headers: form.getHeaders() }
+  );
+}
+
+async function sendText(caption) {
+  await axios.post(
+    `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
     {
-      headers: form.getHeaders(),
-      timeout: 30000,
+      chat_id: CHAT_ID,
+      text: caption,
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
     }
   );
 }
@@ -126,31 +130,42 @@ async function handleSale(slug, event) {
 
   const payload = getPayload(event);
   const { contract, tokenId } = getTokenInfo(payload);
-  const imageUrl = getImageUrl(payload);
-  const { price, symbol } = getPrice(payload);
+
+  const priceData = getPrice(payload);
+  const floor = await getFloor(slug);
+
+  const diff = priceData.value - floor;
+
+  const imageUrl = await getBestImage(contract, tokenId);
 
   const nftUrl = `https://opensea.io/item/polygon/${contract}/${tokenId}`;
+  const txHash = payload?.transaction?.transaction_hash;
+  const saleUrl = txHash
+    ? `https://polygonscan.com/tx/${txHash}`
+    : nftUrl;
 
   const caption = `${config.headline}
 
 <b>${config.tokenLabel} #${tokenId}</b> just sold on OpenSea
 
-💰 <b>Price:</b> ${price} ${symbol}
+💰 <b>Sale:</b> ${priceData.value.toFixed(2)} ${priceData.symbol}
+🏷 <b>Floor:</b> ${floor.toFixed(2)} ${priceData.symbol}
+${formatPct(diff, floor)}
 
-<a href="${nftUrl}">🔗 View NFT on OpenSea</a>`;
+<a href="${nftUrl}">🔗 View NFT</a>
+<a href="${saleUrl}">🧾 View Sale</a>`;
 
   try {
     await sendPhoto(imageUrl, caption);
-    console.log(`Posted photo sale: ${config.name} #${tokenId} for ${price} ${symbol}`);
-  } catch (photoErr) {
-    console.error("Photo failed, sending text instead:", photoErr.response?.data || photoErr.message);
+    console.log("Posted sale with image");
+  } catch (err) {
+    console.log("Image failed, sending text fallback");
     await sendText(caption);
-    console.log(`Posted text sale: ${config.name} #${tokenId} for ${price} ${symbol}`);
   }
 }
 
 const client = new OpenSeaStreamClient({
-  token: process.env.OPENSEA_API_KEY,
+  token: OPENSEA_API_KEY,
   connectOptions: {
     transport: WebSocket,
   },
@@ -165,7 +180,7 @@ Object.keys(COLLECTIONS).forEach((slug) => {
     try {
       await handleSale(slug, event);
     } catch (err) {
-      console.error("Error posting sale:", err.response?.data || err.message);
+      console.error("Error:", err.response?.data || err.message);
     }
   });
 });
