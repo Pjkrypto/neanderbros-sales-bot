@@ -2,6 +2,7 @@ import { OpenSeaStreamClient } from "@opensea/stream-js";
 import WebSocket from "ws";
 import axios from "axios";
 import FormData from "form-data";
+import sharp from "sharp";
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -78,7 +79,7 @@ async function sendText(caption) {
     chat_id: CHAT_ID,
     text: caption,
     parse_mode: "HTML",
-    disable_web_page_preview: false,
+    disable_web_page_preview: true,
   });
 }
 
@@ -87,23 +88,24 @@ async function sendPhoto(imageUrl, caption) {
     throw new Error("No image URL available");
   }
 
+  console.log("Downloading NFT image:", imageUrl);
+
   const img = await axios.get(imageUrl, {
     responseType: "arraybuffer",
     timeout: 30000,
     headers: {
       "User-Agent": "Mozilla/5.0",
-      Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+      Accept: "image/*,*/*;q=0.8",
     },
   });
 
-  const contentType = img.headers["content-type"] || "";
-  console.log("Image content-type:", contentType);
+  const pngBuffer = await sharp(Buffer.from(img.data)).png().toBuffer();
 
   const form = new FormData();
   form.append("chat_id", CHAT_ID);
-  form.append("photo", Buffer.from(img.data), {
+  form.append("photo", pngBuffer, {
     filename: "nft.png",
-    contentType: contentType || "image/png",
+    contentType: "image/png",
   });
   form.append("caption", caption);
   form.append("parse_mode", "HTML");
