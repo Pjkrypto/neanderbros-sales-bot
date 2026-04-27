@@ -9,12 +9,12 @@ const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const COLLECTIONS = {
   [process.env.NEANDERBROS_SLUG]: {
     name: "NeanderBros",
-    headline: "🔥 NEANDERBROS SALE!",
+    headline: "🔥 <b>NEANDERBROS SALE!</b>",
     tokenLabel: "NeanderBro",
   },
   [process.env.NEANDERGALS_SLUG]: {
     name: "NeanderGals",
-    headline: "💎 NEANDERGALS SALE!",
+    headline: "💎 <b>NEANDERGALS SALE!</b>",
     tokenLabel: "NeanderGal",
   },
 };
@@ -34,11 +34,11 @@ function required(name) {
   "NEANDERGALS_SLUG",
 ].forEach(required);
 
-function getEventPayload(event) {
+function getPayload(event) {
   return event?.payload || event;
 }
 
-function getTokenIdAndContract(payload) {
+function getTokenInfo(payload) {
   const nftId = payload?.item?.nft_id || "";
   const parts = nftId.split("/");
 
@@ -62,11 +62,10 @@ function getPrice(payload) {
   const raw = Number(payload?.sale_price || 0);
   const decimals = Number(payload?.payment_token?.decimals || 18);
   const symbol = payload?.payment_token?.symbol || "POL";
-
-  const price = raw / Math.pow(10, decimals);
+  const value = raw / Math.pow(10, decimals);
 
   return {
-    price: price.toLocaleString(undefined, {
+    price: value.toLocaleString(undefined, {
       minimumFractionDigits: 2,
       maximumFractionDigits: 6,
     }),
@@ -74,14 +73,18 @@ function getPrice(payload) {
   };
 }
 
-async function sendTelegramPhoto(imageUrl, caption) {
+async function sendText(caption) {
+  await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+    chat_id: CHAT_ID,
+    text: caption,
+    parse_mode: "HTML",
+    disable_web_page_preview: false,
+  });
+}
+
+async function sendPhoto(imageUrl, caption) {
   if (!imageUrl) {
-    await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-      chat_id: CHAT_ID,
-      text: caption.replace(/<[^>]*>/g, ""),
-      disable_web_page_preview: false,
-    });
-    return;
+    throw new Error("No image URL available");
   }
 
   const img = await axios.get(imageUrl, {
@@ -89,32 +92,38 @@ async function sendTelegramPhoto(imageUrl, caption) {
     timeout: 30000,
     headers: {
       "User-Agent": "Mozilla/5.0",
+      Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
     },
   });
 
+  const contentType = img.headers["content-type"] || "";
+  console.log("Image content-type:", contentType);
+
   const form = new FormData();
   form.append("chat_id", CHAT_ID);
-  form.append("photo", Buffer.from(img.data), "nft.png");
+  form.append("photo", Buffer.from(img.data), {
+    filename: "nft.png",
+    contentType: contentType || "image/png",
+  });
   form.append("caption", caption);
   form.append("parse_mode", "HTML");
 
   await axios.post(
     `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendPhoto`,
     form,
-    { headers: form.getHeaders(), timeout: 30000 }
+    {
+      headers: form.getHeaders(),
+      timeout: 30000,
+    }
   );
 }
 
 async function handleSale(slug, event) {
   const config = COLLECTIONS[slug];
+  if (!config) return;
 
-  if (!config) {
-    console.log(`Unknown collection slug: ${slug}`);
-    return;
-  }
-
-  const payload = getEventPayload(event);
-  const { contract, tokenId } = getTokenIdAndContract(payload);
+  const payload = getPayload(event);
+  const { contract, tokenId } = getTokenInfo(payload);
   const imageUrl = getImageUrl(payload);
   const { price, symbol } = getPrice(payload);
 
@@ -128,9 +137,14 @@ async function handleSale(slug, event) {
 
 <a href="${nftUrl}">🔗 View NFT on OpenSea</a>`;
 
-  await sendTelegramPhoto(imageUrl, caption);
-
-  console.log(`Posted sale: ${config.name} #${tokenId} for ${price} ${symbol}`);
+  try {
+    await sendPhoto(imageUrl, caption);
+    console.log(`Posted photo sale: ${config.name} #${tokenId} for ${price} ${symbol}`);
+  } catch (photoErr) {
+    console.error("Photo failed, sending text instead:", photoErr.response?.data || photoErr.message);
+    await sendText(caption);
+    console.log(`Posted text sale: ${config.name} #${tokenId} for ${price} ${symbol}`);
+  }
 }
 
 const client = new OpenSeaStreamClient({
