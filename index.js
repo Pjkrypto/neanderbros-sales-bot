@@ -371,16 +371,29 @@ const client = new OpenSeaStreamClient({
   },
 });
 
-console.log("🚀 Listening for OpenSea sales...");
+let isSubscribed = false;
 
-Object.keys(COLLECTIONS).forEach((slug) => {
-  console.log(`Subscribing to collection: ${slug}`);
+function startStream() {
+  if (isSubscribed) {
+    console.log("Stream already running, skipping re-init");
+    return;
+  }
 
-  client.onItemSold(slug, async (event) => {
-    try {
-      await handleSale(slug, event);
-    } catch (err) {
-      console.error("Error:", err.response?.data || err.message);
-    }
+  isSubscribed = true;
+
+  console.log("🚀 Listening for OpenSea sales...");
+
+  Object.keys(COLLECTIONS).forEach((slug) => {
+    console.log(`Subscribing to collection: ${slug}`);
+
+    client.onItemSold(slug, async (event) => {
+      try {
+        await handleSale(slug, event);
+      } catch (err) {
+        console.error("Error:", err.response?.data || err.message);
+      }
+    });
   });
-});
+}
+
+startStream();
