@@ -10,6 +10,7 @@ const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
 
 const RARE_TRAIT_THRESHOLD = 10.5;
 const MAX_RARE_TRAITS = 5;
+const SEEN_SALES = new Set();
 
 const COLLECTIONS = {
   [process.env.NEANDERBROS_SLUG]: {
@@ -57,7 +58,29 @@ function getPrice(payload) {
   const symbol = payload?.payment_token?.symbol || "POL";
   const value = raw / Math.pow(10, decimals);
 
-  return { value, symbol };
+  return { value, symbol, raw };
+}
+
+function getSaleKey(payload, contract, tokenId, rawPrice) {
+  const txHash =
+    payload?.transaction?.transaction_hash ||
+    payload?.transaction?.hash ||
+    payload?.transaction_hash ||
+    "";
+
+  return txHash || `${contract}-${tokenId}-${rawPrice}`;
+}
+
+function isDuplicateSale(key) {
+  if (SEEN_SALES.has(key)) return true;
+
+  SEEN_SALES.add(key);
+
+  setTimeout(() => {
+    SEEN_SALES.delete(key);
+  }, 1000 * 60 * 60 * 6);
+
+  return false;
 }
 
 function formatNumber(value, decimals = 2) {
@@ -75,10 +98,10 @@ function formatPercent(value) {
   return `${sign}${value.toFixed(2)}%`;
 }
 
-function formatFloorStatus(salePrice, floorPrice) {
-  if (!floorPrice || floorPrice <= 0) return "Floor: N/A";
+function formatFloorStatus(saleUsd, floorUsd) {
+  if (!floorUsd || floorUsd <= 0) return "📊 <b>Floor Status:</b> N/A";
 
-  const pct = ((salePrice - floorPrice) / floorPrice) * 100;
+  const pct = ((saleUsd - floorUsd) / floorUsd) * 100;
 
   if (Math.abs(pct) < 0.01) return "➖ <b>At Floor</b>";
   if (pct > 0) return `📈 <b>Above Floor:</b> ${formatPercent(pct)}`;
@@ -86,12 +109,13 @@ function formatFloorStatus(salePrice, floorPrice) {
 }
 
 async function getNftData(contract, tokenId) {
-  const url = `https://api.opensea.io/api/v2/chain/polygon/contract/${contract}/nfts/${tokenId}`;
-
-  const res = await axios.get(url, {
-    headers: { "x-api-key": OPENSEA_API_KEY },
-    timeout: 30000,
-  });
+  const res = await axios.get(
+    `https://api.opensea.io/api/v2/chain/polygon/contract/${contract}/nfts/${tokenId}`,
+    {
+      headers: { "x-api-key": OPENSEA_API_KEY },
+      timeout: 30000,
+    }
+  );
 
   return res.data?.nft || {};
 }
@@ -108,35 +132,42 @@ async function getCollectionStats(slug) {
 
     return {
       floorPrice: Number(res.data?.total?.floor_price || 0),
-      marketCap: Number(res.data?.total?.market_cap || 0),
-      numOwners: Number(res.data?.total?.num_owners || 0),
       totalSupply: Number(res.data?.total?.total_supply || 0),
     };
   } catch (err) {
     console.error("Collection stats failed:", err.response?.data || err.message);
-    return {
-      floorPrice: 0,
-      marketCap: 0,
-      numOwners: 0,
-      totalSupply: 0,
-    };
+    return { floorPrice: 0, totalSupply: 0 };
   }
 }
 
-async function getPolUsd() {
+async function getUsdRate(symbol) {
+  const normalized = String(symbol || "").toUpperCase();
+
+  const idsBySymbol = {
+    POL: "polygon-ecosystem-token,matic-network",
+    MATIC: "matic-network,polygon-ecosystem-token",
+    WETH: "weth",
+    ETH: "ethereum",
+    USDC: "usd-coin",
+    USDT: "tether",
+  };
+
+  const ids = idsBySymbol[normalized] || "polygon-ecosystem-token,matic-network";
+
   try {
     const res = await axios.get(
-      "https://api.coingecko.com/api/v3/simple/price?ids=polygon-ecosystem-token,matic-network&vs_currencies=usd",
+      `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd`,
       { timeout: 30000 }
     );
 
-    return (
-      Number(res.data?.["polygon-ecosystem-token"]?.usd) ||
-      Number(res.data?.["matic-network"]?.usd) ||
-      0
-    );
+    for (const id of ids.split(",")) {
+      const price = Number(res.data?.[id]?.usd || 0);
+      if (price) return price;
+    }
+
+    return 0;
   } catch (err) {
-    console.error("POL/USD fetch failed:", err.response?.data || err.message);
+    console.error(`${symbol}/USD fetch failed:`, err.response?.data || err.message);
     return 0;
   }
 }
@@ -185,7 +216,7 @@ function getTraitFields(trait) {
 function getRareTraits(nft, totalSupply) {
   const traits = Array.isArray(nft?.traits) ? nft.traits : [];
 
-  const enriched = traits
+  return traits
     .map((trait) => {
       const { type, value, count } = getTraitFields(trait);
 
@@ -193,32 +224,21 @@ function getRareTraits(nft, totalSupply) {
 
       const pct = (count / totalSupply) * 100;
 
-      return {
-        type,
-        value,
-        count,
-        pct,
-      };
+      return { type, value, count, pct };
     })
     .filter(Boolean)
     .filter((trait) => trait.pct <= RARE_TRAIT_THRESHOLD)
     .sort((a, b) => a.pct - b.pct)
     .slice(0, MAX_RARE_TRAITS);
-
-  return enriched;
 }
 
 function formatRareTraits(traits) {
   if (!traits.length) return "";
 
-  const lines = traits.map(
-    (t) => `${t.type}: ${t.value} — ${t.count} (${t.pct.toFixed(2)}%)`
-  );
-
   return `
 
 🧬 <b>Rare Traits:</b>
-${lines.join("\n")}`;
+${traits.map((t) => `${t.type}: ${t.value} — ${t.count} (${t.pct.toFixed(2)}%)`).join("\n")}`;
 }
 
 function getImageUrl(nft) {
@@ -278,21 +298,32 @@ async function handleSale(slug, event) {
 
   const payload = getPayload(event);
   const { contract, tokenId } = getTokenInfo(payload);
-  const { value: salePrice, symbol } = getPrice(payload);
+  const { value: salePrice, symbol, raw: rawPrice } = getPrice(payload);
 
-  const [nft, stats, polUsd] = await Promise.all([
+  const saleKey = getSaleKey(payload, contract, tokenId, rawPrice);
+  if (isDuplicateSale(saleKey)) {
+    console.log(`Duplicate sale skipped: ${saleKey}`);
+    return;
+  }
+
+  const [nft, stats, saleUsdRate] = await Promise.all([
     getNftData(contract, tokenId).catch((err) => {
       console.error("NFT data failed:", err.response?.data || err.message);
       return {};
     }),
     getCollectionStats(slug),
-    getPolUsd(),
+    getUsdRate(symbol),
   ]);
+
+  const floorSymbol = symbol;
+  const floorUsdRate = await getUsdRate(floorSymbol);
+
+  const saleUsd = saleUsdRate ? salePrice * saleUsdRate : 0;
+  const floorUsd = floorUsdRate && stats.floorPrice ? stats.floorPrice * floorUsdRate : 0;
 
   const imageUrl = getImageUrl(nft);
   const rank = getRank(nft);
   const rareTraits = getRareTraits(nft, stats.totalSupply);
-  const usdValue = polUsd ? salePrice * polUsd : 0;
 
   const nftUrl = `https://opensea.io/item/polygon/${contract}/${tokenId}`;
 
@@ -304,27 +335,30 @@ async function handleSale(slug, event) {
 
   const txUrl = txHash ? `https://polygonscan.com/tx/${txHash}` : "";
 
+  const usdLine = saleUsd ? `\n💵 <b>USD:</b> ~$${formatNumber(saleUsd, 2)}` : "";
   const rankLine = rank ? `\n🏆 <b>Rank:</b> #${rank}` : "";
-  const usdLine = usdValue ? `\n💵 <b>USD:</b> ~$${formatNumber(usdValue, 2)}` : "";
+  const floorLine = stats.floorPrice
+    ? `🏷 <b>Floor:</b> ${formatNumber(stats.floorPrice, 4)} ${floorSymbol}`
+    : "🏷 <b>Floor:</b> N/A";
   const txLine = txUrl ? `\n<a href="${txUrl}">🧾 View Tx</a>` : "";
 
   const caption = `${config.headline}
 
 <b>${config.tokenLabel} #${tokenId}</b> just sold on OpenSea
 
-💰 <b>Sale:</b> ${formatNumber(salePrice, 2)} ${symbol}${usdLine}
-🏷 <b>Floor:</b> ${formatNumber(stats.floorPrice, 2)} ${symbol}
-${formatFloorStatus(salePrice, stats.floorPrice)}${rankLine}${formatRareTraits(rareTraits)}
+💰 <b>Sale:</b> ${formatNumber(salePrice, 4)} ${symbol}${usdLine}
+${floorLine}
+${formatFloorStatus(saleUsd, floorUsd)}${rankLine}${formatRareTraits(rareTraits)}
 
-<a href="${nftUrl}">🔗 View NFT</a>${txLine}`;
+<a href="${nftUrl}">🔗 View NFT on OpenSea</a>${txLine}`;
 
   try {
     await sendPhoto(imageUrl, caption);
-    console.log(`Posted photo sale: ${config.name} #${tokenId}`);
+    console.log(`Posted photo sale: ${config.name} #${tokenId} for ${salePrice} ${symbol}`);
   } catch (err) {
     console.error("Photo failed, sending text fallback:", err.response?.data || err.message);
     await sendText(caption);
-    console.log(`Posted text sale: ${config.name} #${tokenId}`);
+    console.log(`Posted text sale: ${config.name} #${tokenId} for ${salePrice} ${symbol}`);
   }
 }
 
