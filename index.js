@@ -8,8 +8,8 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
 
-const RARE_TRAIT_THRESHOLD = 10.5;
-const MAX_RARE_TRAITS = 5;
+const RARE_TRAIT_THRESHOLD = 15;
+const MAX_TRAITS = 5;
 const SEEN_SALES = new Set();
 
 const COLLECTIONS = {
@@ -92,20 +92,15 @@ function formatNumber(value, decimals = 2) {
   });
 }
 
-function formatPercent(value) {
-  if (!Number.isFinite(value)) return "N/A";
-  const sign = value > 0 ? "+" : "";
-  return `${sign}${value.toFixed(2)}%`;
-}
-
 function formatFloorStatus(saleUsd, floorUsd) {
   if (!floorUsd || floorUsd <= 0) return "📊 <b>Floor Status:</b> N/A";
 
   const pct = ((saleUsd - floorUsd) / floorUsd) * 100;
+  const absPct = Math.abs(pct).toFixed(2);
 
   if (Math.abs(pct) < 0.01) return "➖ <b>At Floor</b>";
-  if (pct > 0) return `📈 <b>Above Floor:</b> ${formatPercent(pct)}`;
-  return `📉 <b>Below Floor:</b> ${formatPercent(pct)}`;
+  if (pct > 0) return `📈 <b>Above Floor:</b> +${absPct}%`;
+  return `📉 <b>Below Floor:</b> ${absPct}%`;
 }
 
 async function getNftData(contract, tokenId) {
@@ -146,7 +141,7 @@ async function getUsdRate(symbol) {
   const idsBySymbol = {
     POL: "polygon-ecosystem-token,matic-network",
     MATIC: "matic-network,polygon-ecosystem-token",
-    WETH: "weth",
+    WETH: "weth,ethereum",
     ETH: "ethereum",
     USDC: "usd-coin",
     USDT: "tether",
@@ -213,31 +208,40 @@ function getTraitFields(trait) {
   return { type, value, count };
 }
 
-function getRareTraits(nft, totalSupply) {
+function getTopTraits(nft, totalSupply) {
   const traits = Array.isArray(nft?.traits) ? nft.traits : [];
 
-  return traits
+  const allTraits = traits
     .map((trait) => {
       const { type, value, count } = getTraitFields(trait);
 
       if (!type || !value || !count || !totalSupply) return null;
 
-      const pct = (count / totalSupply) * 100;
-
-      return { type, value, count, pct };
+      return {
+        type,
+        value,
+        count,
+        pct: (count / totalSupply) * 100,
+      };
     })
     .filter(Boolean)
-    .filter((trait) => trait.pct <= RARE_TRAIT_THRESHOLD)
-    .sort((a, b) => a.pct - b.pct)
-    .slice(0, MAX_RARE_TRAITS);
+    .sort((a, b) => a.pct - b.pct);
+
+  const rareTraits = allTraits.filter((trait) => trait.pct <= RARE_TRAIT_THRESHOLD);
+
+  if (rareTraits.length) {
+    return rareTraits.slice(0, MAX_TRAITS);
+  }
+
+  return allTraits.slice(0, 3);
 }
 
-function formatRareTraits(traits) {
+function formatTraits(traits) {
   if (!traits.length) return "";
 
   return `
 
-🧬 <b>Rare Traits:</b>
+🧬 <b>Top Traits:</b>
 ${traits.map((t) => `${t.type}: ${t.value} — ${t.count} (${t.pct.toFixed(2)}%)`).join("\n")}`;
 }
 
@@ -315,15 +319,12 @@ async function handleSale(slug, event) {
     getUsdRate(symbol),
   ]);
 
-  const floorSymbol = symbol;
-  const floorUsdRate = await getUsdRate(floorSymbol);
-
   const saleUsd = saleUsdRate ? salePrice * saleUsdRate : 0;
-  const floorUsd = floorUsdRate && stats.floorPrice ? stats.floorPrice * floorUsdRate : 0;
+  const floorUsd = saleUsdRate && stats.floorPrice ? stats.floorPrice * saleUsdRate : 0;
 
   const imageUrl = getImageUrl(nft);
   const rank = getRank(nft);
-  const rareTraits = getRareTraits(nft, stats.totalSupply);
+  const topTraits = getTopTraits(nft, stats.totalSupply);
 
   const nftUrl = `https://opensea.io/item/polygon/${contract}/${tokenId}`;
 
@@ -338,7 +339,7 @@ async function handleSale(slug, event) {
   const usdLine = saleUsd ? `\n💵 <b>USD:</b> ~$${formatNumber(saleUsd, 2)}` : "";
   const rankLine = rank ? `\n🏆 <b>Rank:</b> #${rank}` : "";
   const floorLine = stats.floorPrice
-    ? `🏷 <b>Floor:</b> ${formatNumber(stats.floorPrice, 4)} ${floorSymbol}`
+    ? `🏷 <b>Floor:</b> ${formatNumber(stats.floorPrice, 4)} ${symbol}`
     : "🏷 <b>Floor:</b> N/A";
   const txLine = txUrl ? `\n<a href="${txUrl}">🧾 View Tx</a>` : "";
 
@@ -347,8 +348,9 @@ async function handleSale(slug, event) {
 <b>${config.tokenLabel} #${tokenId}</b> just sold on OpenSea
 
 💰 <b>Sale:</b> ${formatNumber(salePrice, 4)} ${symbol}${usdLine}
+
 ${floorLine}
-${formatFloorStatus(saleUsd, floorUsd)}${rankLine}${formatRareTraits(rareTraits)}
+${formatFloorStatus(saleUsd, floorUsd)}${rankLine}${formatTraits(topTraits)}
 
 <a href="${nftUrl}">🔗 View NFT on OpenSea</a>${txLine}`;
 
